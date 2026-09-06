@@ -1,0 +1,4 @@
+bench.txt
+/testdata/fuzz/
+*.test
+*.out
