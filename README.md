@@ -158,9 +158,10 @@ go test ./...
 | `TestStringifyAgainstJS` | 628 | full documents, plus `Object.keys` order checked separately |
 | `TestLiveDifferentialAgainstJS` | 20000 | documents generated **in Go** and stringified by a **live `bun`** — the generator and the oracle on opposite sides |
 | `TestEncodingJSONWouldDiverge` | — | fails if stdlib *passes* a category, i.e. if the corpus stopped discriminating |
-| `FuzzDecode` | 610k execs | decode → marshal → decode is a fixed point; anything decodable is encodable |
+| `FuzzDecode` | 5.9M execs | decode → marshal → decode is a fixed point; anything decodable is encodable |
 | `FuzzNumberFormat` | 2.0M execs | round-trip, plus cross-check against a slow literal transcription of the spec |
 | property tests | 220k | 200k random doubles, 20k random documents |
+| *(retired)* `FuzzDecodeMatchesLegacy` | 3.2M execs | ran once, against the `encoding/json` decoder this one replaced: same accept/reject and same output bytes on arbitrary input. Deleted with the implementation it compared against |
 
 The suite was mutation-tested: moving the exponential threshold from 21 to 20,
 escaping `<>&` like Go does, and dropping the `[[OwnPropertyKeys]]` rule are
@@ -168,61 +169,94 @@ each caught.
 
 ## Performance
 
-Intel Xeon E-2386G, Go 1.27.0, `-count=6`, medians. The workload is one page of
-1000 records — what a paginator hashes for loop detection — and one webhook
-body, which is what `buildWebhookDeliveryRequest` signs.
+Intel Xeon E-2386G, Go 1.27.0. The workload is one page of 1000 records — what
+a paginator hashes for loop detection — and one webhook body, which is what
+`buildWebhookDeliveryRequest` signs.
+
+`B/op` and `allocs/op` are exact. `ns/op` is the **minimum of six interleaved
+runs**, not the median: this is a shared box that sits at load 10–18, where
+medians swing ±80% and the minimum is the only figure that reproduces. (It does
+reproduce: the pre-`jsontext` minima below match the medians this table
+previously carried, to within 1%.)
 
 | | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `Decode` webhook body | 5,097 | 4,065 | 110 |
-| `Decode` 1000-record page | 1,847,396 | 1,380,910 | 44,012 |
-| — `encoding/json` for reference | 2,795,610 | 979,760 | 28,124 |
-| `MarshalJS` webhook body | 1,119 | 768 | 2 |
-| `MarshalJS` 1000-record page | 531,572 | 686,822 | 21 |
-| `AppendJS` 1000-record page (reused buffer) | 388,892 | **24** | **1** |
-| — `encoding/json` encoder for reference | 6,867,873 | 6,217,110 | 95,048 |
-| `StableMarshal` 1000-record page | 619,435 | 686,918 | 23 |
-| `KeyOrder`, no index keys | 16 | 0 | 0 |
-| `KeyOrder`, with index keys | 228 | 128 | 1 |
+| `Decode` webhook body | **3,873** | **2,632** | **74** |
+| `Decode` 1000-record page | **1,550,579** | **1,147,975** | **29,995** |
+| — the same, before `jsontext` | 4,910 / 1,830,754 | 4,065 / 1,380,972 | 110 / 44,012 |
+| — `encoding/json` into `any`, key order LOST | 2,868,034 | 979,857 | 28,125 |
+| — `jsontext` token scan, building nothing | 255,641 | 448 | 7 |
+| `MarshalJS` webhook body | 1,083 | 768 | 2 |
+| `MarshalJS` 1000-record page | 519,403 | 686,746 | 21 |
+| `AppendJS` 1000-record page (reused buffer) | 388,466 | **24** | **1** |
+| — `encoding/json` encoder for reference | 7,097,800 | 6,253,947 | 95,044 |
+| `StableMarshal` 1000-record page | 608,914 | 686,798 | 22 |
+| `KeyOrder`, no index keys | 15.5 | 0 | 0 |
+| `KeyOrder`, with index keys | 222 | 128 | 1 |
 | `AppendNumber` integer | 13 | 0 | 0 |
-| `AppendNumber` float | 36 | 0 | 0 |
-| `AppendString` | 86 | 0 | 0 |
+| `AppendNumber` float | 35 | 0 | 0 |
+| `AppendString` | 82 | 0 | 0 |
 
-Against `encoding/json`'s encoder on the same page, `MarshalJS` is **12.9×
-faster with 4,526× fewer allocations** (21 vs 95,048), and `AppendJS` into a
-caller-owned buffer is **17.7× faster at a single allocation**. Decoding is 1.5×
-faster than stdlib *while preserving key order*, at 1.6× the allocations — that
-extra is the ordered map's key slice and hash table per object, which is what
-buys the ordering.
+Against `encoding/json`'s encoder on the same page, `MarshalJS` is **13.7×
+faster with 4,526× fewer allocations** (21 vs 95,044), and `AppendJS` into a
+caller-owned buffer is **18.3× faster at a single allocation**. Decoding is
+**1.85× faster than stdlib's own decode into `any` while additionally preserving
+key order**, at 1.07× the allocations — that remainder is the ordered map's key
+slice and hash table per object, which is what buys the ordering.
+
+The last reference row is the one that says whether there is anything left to
+win: reading every token and building **nothing** costs 256 µs of the 1,551 µs.
+So 84% of decode is constructing the ordered value model, not parsing — three
+allocations per object for `gnata.OrderedMap` (struct, key slice, hash table)
+plus one interface box per value. Shaving the parser further would move a
+sixth of the time at most.
+
+### The decoder reads `encoding/json/jsontext`
+
+Both `encoding/json`'s `Decoder.Token` and `jsontext`'s `Decoder.ReadToken`
+preserve order and both are standard library in Go 1.27. The difference is that
+`Token` returns `any`, so every string, number, delimiter and boolean is boxed
+on the way out; a memory profile put **52% of decode allocations in
+`Decoder.Token` alone**. `jsontext.Token` is a struct.
+
+Switching cost 32% of the allocations and about a quarter of the wall time, with
+**no new dependency and no second string unescaper** — which is why this was
+taken and the `tidwall/gjson` prototype (P-2, 1.6× on its own) was not: gjson's
+unescaping is a second implementation of the same value semantics, exactly what
+D-0013 forbids without its own differential corpus. See D-0026.
+
+Two options are required for parity and both are off by default, because
+`jsontext` implements RFC 7493 and `JSON.parse` does not:
+`AllowDuplicateNames(true)` and `AllowInvalidUTF8(true)`. Without the first,
+`{"a":1,"a":2}` is rejected outright; without the second, so is a lone
+surrogate, where `encoding/json` silently substituted U+FFFD.
+
+3.2 million fuzz executions compared the two decoders on arbitrary bytes — same
+accept/reject, same output bytes — before the old one was deleted.
 
 ### Against JavaScript
 
-Same workload, 200 iterations over a 1000-record page (144,875 bytes):
+Same workload, 200 iterations over a 1000-record page (144,875 bytes), all
+three binaries interleaved in one session, minimum of twelve rounds each:
 
 | | decode ms/iter | encode ms/iter | peak RSS |
 |---|---:|---:|---:|
-| **Go (jsorder)** | **2.091** | **0.381** | **10.6 MiB** |
-| bun 1.x | 0.481 | 0.664 | 87.3 MiB |
-| node | 0.515 | 0.555 | — |
+| **Go (jsorder), now** | **1.455** | **0.381** | **9.4 MiB** |
+| Go (jsorder), before `jsontext` | 2.053 | 0.379 | 10.0 MiB |
+| bun 1.3.14 | 0.483 | 0.595 | 86 MiB |
 
 ```sh
 go run ./internal/bench
 bun internal/bench/bench.mjs
 ```
 
-**Encoding is 1.7× faster than bun in a twelfth of the memory. Decoding is 4.3×
-SLOWER**, and that is a real finding rather than a rounding error: V8 and
-JavaScriptCore parse JSON with hand-written C++, and Go's `encoding/json` token
-API boxes every string and number into an `any`. A profile attributes ~50% of
-decode allocations to `Decoder.Token` alone.
-
-A prototype using `tidwall/gjson` — already a transitive dependency through
-gnata, so free — decodes the same page in **1.04 ms/iter including a full
-validation pass**, against 2.90 for `json.Unmarshal`. That is a ~1.6× win for
-this package's decoder and it still would not close the gap to bun. It was
-**not** adopted here: gjson's string unescaping is a second implementation of
-the same value semantics, which is precisely what D-0013 says not to introduce
-without its own differential corpus. Recorded as a measured lead, not done.
+**Encoding is 1.56× faster than bun in a ninth of the memory. Decoding is 3.0×
+SLOWER**, improved from 4.25× — a real gap, honestly reported. V8 and
+JavaScriptCore parse JSON with hand-written C++ into objects with inline
+properties and interned strings; Go builds a hash table and a key slice per
+object and boxes every value into an interface. The reference rows in the table
+above bound what is left: the parse itself is 16% of the time, so even a free
+parser would leave Go at roughly 2.5× bun.
 
 ### Concurrency: measured, and deliberately not shipped
 

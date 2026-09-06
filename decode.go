@@ -3,11 +3,11 @@ package jsorder
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
-	"strconv"
 	"sync"
 )
 
@@ -55,54 +55,122 @@ func DecodeFloat64(data []byte) (any, error) {
 	return decode(data, true)
 }
 
+// decodeOptions restores JSON.parse's permissiveness, which jsontext does not
+// have by default because it implements RFC 7493 rather than RFC 8259.
+//
+//   - Duplicate keys: JavaScript keeps the LAST value at the FIRST key's
+//     position; jsontext rejects the document outright. [decState.object]
+//     applies the JavaScript rule, so allowing them here is all that is needed.
+//   - Invalid UTF-8: JavaScript replaces a malformed sequence with U+FFFD
+//     rather than failing the parse, and so does jsontext under this option.
+//     That replacement is also why a lone surrogate cannot round-trip — see
+//     DIVERGENCES J-04, which jsontext does not change.
+//
+// A package-level slice rather than a literal at each call site so that passing
+// it variadically to Reset costs nothing.
+var decodeOptions = []jsontext.Options{
+	jsontext.AllowDuplicateNames(true),
+	jsontext.AllowInvalidUTF8(true),
+}
+
+// decState holds the reader and the scratch shared by one Decode call.
+//
+// It reads through encoding/json/jsontext rather than encoding/json's
+// Decoder.Token. Both are standard library and both preserve order; the
+// difference is that Token returns `any`, so every string, number, delimiter
+// and boolean is boxed into an interface on the way out. A memory profile of a
+// 1000-record page put 52% of the decoder's allocations in Decoder.Token alone.
+// jsontext.Token is a struct, so the same walk allocates only for the values
+// that genuinely escape.
+type decState struct {
+	dec     *jsontext.Decoder
+	pairs   []pair
+	asFloat bool
+
+	// park is where the decoder is pointed on release, so that a pooled state
+	// does not keep the caller's last document alive. Resetting onto a
+	// *bytes.Buffer drops the decoder's own buffer, which is the aliased one.
+	park bytes.Buffer
+}
+
+var decStatePool = sync.Pool{New: func() any { return new(decState) }}
+
 func decode(data []byte, asFloat bool) (any, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	value, err := decodeValue(dec, asFloat)
+	s := decStatePool.Get().(*decState)
+	s.asFloat = asFloat
+
+	// bytes.Buffer, not bytes.Reader: jsontext parses a *bytes.Buffer in place
+	// rather than copying it into an intermediate buffer (decode.go:119). On a
+	// 145 KB page that is a whole memcpy per call, traded for one 32-byte
+	// header.
+	r := bytes.NewBuffer(data)
+	if s.dec == nil {
+		s.dec = jsontext.NewDecoder(r, decodeOptions...)
+	} else {
+		s.dec.Reset(r, decodeOptions...)
+	}
+
+	value, err := s.document()
+	s.release()
+	if err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func (s *decState) document() (any, error) {
+	tok, err := s.dec.ReadToken()
+	if err != nil {
+		return nil, err
+	}
+	value, err := s.value(tok)
 	if err != nil {
 		return nil, err
 	}
 	// Reject trailing content, as json.Unmarshal does — a decoder left
 	// mid-stream would silently accept `{"a":1} garbage`.
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+	if _, err := s.dec.ReadToken(); !errors.Is(err, io.EOF) {
 		return nil, ErrTrailingContent
 	}
 	return value, nil
 }
 
-func decodeValue(dec *json.Decoder, asFloat bool) (any, error) {
-	token, err := dec.Token()
-	if err != nil {
-		return nil, err
-	}
-	return decodeFrom(dec, token, asFloat)
+func (s *decState) release() {
+	s.dec.Reset(&s.park, decodeOptions...)
+	// The values are `any` and would otherwise keep a whole decoded document
+	// alive in the pool.
+	clear(s.pairs)
+	s.pairs = s.pairs[:0]
+	decStatePool.Put(s)
 }
 
-func decodeFrom(dec *json.Decoder, token json.Token, asFloat bool) (any, error) {
-	switch t := token.(type) {
-	case json.Delim:
-		switch t {
-		case '{':
-			return decodeObject(dec, asFloat)
-		case '[':
-			return decodeArray(dec, asFloat)
+func (s *decState) value(tok jsontext.Token) (any, error) {
+	switch tok.Kind() {
+	case '"':
+		return tok.String(), nil
+	case '0':
+		if !s.asFloat {
+			// Token.String on a number returns the raw literal, which is
+			// exactly what json.Number has to hold (D-0017).
+			return json.Number(tok.String()), nil
 		}
-		return nil, fmt.Errorf("jsorder: unexpected %q", t)
-	case json.Number:
-		if !asFloat {
-			return t, nil
-		}
-		f, err := strconv.ParseFloat(t.String(), 64)
+		f, err := tok.Float()
 		if err != nil {
-			return nil, fmt.Errorf("jsorder: invalid JSON number %q: %w", t.String(), err)
+			return nil, fmt.Errorf("jsorder: invalid JSON number %q: %w", tok.String(), err)
 		}
 		return f, nil
-	case string, bool:
-		return t, nil
-	case nil:
+	case '{':
+		return s.object()
+	case '[':
+		return s.array()
+	case 't':
+		return true, nil
+	case 'f':
+		return false, nil
+	case 'n':
 		return Null, nil
 	}
-	return token, nil
+	return nil, fmt.Errorf("jsorder: unexpected %q", byte(tok.Kind()))
 }
 
 type pair struct {
@@ -110,118 +178,100 @@ type pair struct {
 	value any
 }
 
-// pairPool holds the scratch used to accumulate one object's entries.
+// object reads members until the closing brace, whose opening the caller has
+// already consumed.
 //
-// The entries are collected here rather than written straight into a Map
-// because the final ORDER is not known until the last key has been read, and
-// building a Map and then rebuilding it in order — which is what JSOrder does —
-// allocates a second map, a second key slice and a second hash table for every
-// object that has a numeric key. That shape is not exotic: an integration keyed
-// by numeric custom-field id produces it on every record of every page.
-var pairPool = sync.Pool{
-	New: func() any {
-		s := make([]pair, 0, 16)
-		return &s
-	},
-}
-
-// linearScanLimit is where duplicate-key detection stops scanning and builds an
-// index. Duplicate keys are rare, so the scan is normally a few comparisons;
-// without the fallback a hostile 100k-key object would be quadratic.
-const linearScanLimit = 16
-
-func decodeObject(dec *json.Decoder, asFloat bool) (*Map, error) {
-	scratch := pairPool.Get().(*[]pair)
-	pairs := (*scratch)[:0]
-	defer func() {
-		// Clear before returning it: the values are `any` and would otherwise
-		// keep a whole decoded document alive in the pool.
-		clear(pairs)
-		*scratch = pairs[:0]
-		pairPool.Put(scratch)
-	}()
-
-	var seen map[string]int
+// The entries are collected on a shared stack rather than written straight into
+// a Map, because the final ORDER is not known until the last key has been read,
+// and building a Map and then rebuilding it in order — which is what JSOrder
+// does — allocates a second map, a second key slice and a second hash table for
+// every object that has a numeric key. That shape is not exotic: an integration
+// keyed by numeric custom-field id produces it on every record of every page.
+//
+// One stack for the whole document, indexed by depth, rather than a pooled
+// slice per object: nested objects simply take a higher window of the same
+// backing array, so a page of 1000 records borrows it 2000 times and allocates
+// once.
+//
+// Duplicate keys are NOT detected here, and that is deliberate rather than an
+// omission. A repeated key must keep its first POSITION and its last VALUE,
+// which is what a JavaScript object literal and JSON.parse both do — and it is
+// also exactly what Map.Set does, since Set appends to the key order only when
+// the key is new. Staging both occurrences and letting Set collapse them gives
+// the same object as scanning for the duplicate first, for any ordering,
+// because compareKeys returns 0 for two copies of one key and the sort is
+// stable. The scan it replaces was a few string comparisons per member on every
+// object in every document, to serve a case that is essentially absent from
+// real payloads.
+func (s *decState) object() (*Map, error) {
+	base := len(s.pairs)
 	hasIndex := false
 
-	for dec.More() {
-		keyToken, err := dec.Token()
+	for {
+		tok, err := s.dec.ReadToken()
 		if err != nil {
 			return nil, err
 		}
-		key, ok := keyToken.(string)
-		if !ok {
+		if tok.Kind() == '}' {
+			break
+		}
+		if tok.Kind() != '"' {
 			return nil, fmt.Errorf("jsorder: non-string object key")
 		}
-		value, err := decodeValue(dec, asFloat)
+		key := tok.String()
+
+		valueTok, err := s.dec.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		value, err := s.value(valueTok)
 		if err != nil {
 			return nil, err
 		}
 
-		// A repeated key keeps its first POSITION and its last VALUE, which is
-		// what a JavaScript object literal and JSON.parse both do.
-		if at, dup := findKey(pairs, seen, key); dup {
-			pairs[at].value = value
-			continue
-		}
-		if seen == nil && len(pairs) >= linearScanLimit {
-			seen = make(map[string]int, 2*len(pairs))
-			for i, p := range pairs {
-				seen[p.key] = i
-			}
-		}
-		if seen != nil {
-			seen[key] = len(pairs)
-		}
-		pairs = append(pairs, pair{key, value})
+		s.pairs = append(s.pairs, pair{key, value})
 		if !hasIndex {
 			_, hasIndex = IsArrayIndex(key)
 		}
 	}
-	if _, err := dec.Token(); err != nil { // closing '}'
-		return nil, err
-	}
+
+	entries := s.pairs[base:]
 
 	// Enumeration order is JavaScript's, not the document's: array-index keys
 	// come first in numeric order. Applied once here, at the boundary where
 	// external JSON becomes an object, rather than at every read.
 	if hasIndex {
-		slices.SortStableFunc(pairs, func(a, b pair) int { return compareKeys(a.key, b.key) })
+		slices.SortStableFunc(entries, func(a, b pair) int { return compareKeys(a.key, b.key) })
 	}
 
-	// Sized exactly, so neither the key slice nor the hash table grows.
-	m := NewCap(len(pairs))
-	for _, p := range pairs {
+	// Sized so neither the key slice nor the hash table grows. Exact unless the
+	// object repeated a key, in which case it is an upper bound and the map is
+	// slightly over-allocated — the price of not scanning for duplicates.
+	m := NewCap(len(entries))
+	for _, p := range entries {
 		m.Set(p.key, p.value)
 	}
+
+	clear(entries)
+	s.pairs = s.pairs[:base]
 	return m, nil
 }
 
-func findKey(pairs []pair, seen map[string]int, key string) (int, bool) {
-	if seen != nil {
-		at, ok := seen[key]
-		return at, ok
-	}
-	for i := range pairs {
-		if pairs[i].key == key {
-			return i, true
-		}
-	}
-	return 0, false
-}
-
-func decodeArray(dec *json.Decoder, asFloat bool) ([]any, error) {
+func (s *decState) array() ([]any, error) {
 	// Non-nil so an empty array marshals as [] rather than null.
 	out := []any{}
-	for dec.More() {
-		value, err := decodeValue(dec, asFloat)
+	for {
+		tok, err := s.dec.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Kind() == ']' {
+			return out, nil
+		}
+		value, err := s.value(tok)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, value)
 	}
-	if _, err := dec.Token(); err != nil { // closing ']'
-		return nil, err
-	}
-	return out, nil
 }

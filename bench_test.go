@@ -3,6 +3,9 @@ package jsorder
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
+	"io"
 	"math"
 	"strconv"
 	"testing"
@@ -283,5 +286,30 @@ func BenchmarkIsArrayIndex(b *testing.B) {
 	}
 	if math.IsNaN(sinkFloat) {
 		b.Fatal("unreachable")
+	}
+}
+
+// BenchmarkDecodeTokensPage1000 is the hard lower bound: the jsontext scan over
+// the same bytes with no value model built at all. Decode cannot beat it, and
+// the gap between the two is the cost of the ordered tree rather than of
+// parsing — which is the number that says whether there is anything left to
+// win here.
+func BenchmarkDecodeTokensPage1000(b *testing.B) {
+	_, data := benchInputs()
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		dec := jsontext.NewDecoder(bytes.NewBuffer(data), decodeOptions...)
+		for {
+			_, err := dec.ReadToken()
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, io.EOF) {
+				b.Fatal(err)
+			}
+			break
+		}
 	}
 }

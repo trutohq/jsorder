@@ -223,13 +223,40 @@ func TestJSONNumberIsValidated(t *testing.T) {
 	}
 }
 
+// TestDuplicateKeyKeepsFirstPositionLastValue pins the rule the decoder gets
+// from Map.Set rather than from a scan of its own: a repeated key keeps its
+// first POSITION and its last VALUE. The array-index and long-object cases are
+// the ones that could break if the staging or the sort ever changed, since a
+// duplicate has to survive a stable sort and a map larger than one hash group.
 func TestDuplicateKeyKeepsFirstPositionLastValue(t *testing.T) {
-	v, err := DecodeFloat64([]byte(`{"a":1,"b":2,"a":3}`))
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", `{"a":1,"b":2,"a":3}`, `{"a":3,"b":2}`},
+		{"three of the same key", `{"a":1,"b":2,"a":3,"a":4}`, `{"a":4,"b":2}`},
+		{"array-index key repeated", `{"2":1,"1":2,"2":3}`, `{"1":2,"2":3}`},
+		{"index and string key repeated", `{"z":1,"10":2,"z":3,"2":4,"10":5}`,
+			`{"2":4,"10":5,"z":3}`},
+		{"repeat past the hash-group boundary",
+			`{"k0":0,"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,` +
+				`"k9":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,` +
+				`"k16":16,"k17":17,"k0":99}`,
+			`{"k0":99,"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,` +
+				`"k9":9,"k10":10,"k11":11,"k12":12,"k13":13,"k14":14,"k15":15,` +
+				`"k16":16,"k17":17}`},
 	}
-	if want, got := `{"a":3,"b":2}`, mustMarshalJS(t, v); got != want {
-		t.Errorf("got %s, want %s", got, want)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := DecodeFloat64([]byte(tc.in))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := mustMarshalJS(t, v); got != tc.want {
+				t.Errorf("got %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -321,10 +348,11 @@ func TestAppendJSSharesABuffer(t *testing.T) {
 }
 
 // TestDecodeBoundsDepth records that the decoder is already safe against
-// hostile nesting, and why: encoding/json's Decoder enforces its own max depth
-// (10000) on Token(), so the recursion in decodeValue cannot be driven deep
-// enough to exhaust the stack. This is a test rather than a comment because it
-// is a property of the standard library that could change.
+// hostile nesting, and why: jsontext's state machine enforces its own max depth
+// (maxNestingDepth = 10000, jsontext/state.go:53) on ReadToken, so the
+// recursion in decState.value cannot be driven deep enough to exhaust the
+// stack. This is a test rather than a comment because it is a property of the
+// standard library that could change.
 func TestDecodeBoundsDepth(t *testing.T) {
 	deep := strings.Repeat("[", 1_000_000) + strings.Repeat("]", 1_000_000)
 	if _, err := Decode([]byte(deep)); err == nil {
