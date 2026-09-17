@@ -1,0 +1,21 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  # gomod, not npm: this repo is a Go module. The sibling repos this was copied
+  # from are npm packages, and an ecosystem with no matching manifest is a
+  # config Dependabot simply never acts on.
+  - package-ecosystem: "gomod" # See documentation for possible values
+    directory: "/" # Location of package manifests
+    schedule:
+      interval: "weekly"
+
+  # The workflows themselves drift too, and a pinned action going stale is the
+  # same class of problem as a pinned dependency.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
