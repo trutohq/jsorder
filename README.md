@@ -302,3 +302,11 @@ why it was accepted anyway.
 
 `docs/go-port/wiki/` in the `truto` repo: `DECISIONS.md` (D-0015 … D-0018),
 `DIVERGENCES.md` (J-01 … J-05), `GOTCHAS.md`, `TRACKER.md`.
+
+## Number formatting lives in jsbuiltin (2026-10-31)
+
+`AppendNumber` and `FormatNumber` are wrappers over
+[github.com/trutohq/jsbuiltin](../jsbuiltin), which holds JavaScript's
+built-in operations (gotruto D-0868). The API and this package's number tests
+are unchanged. jsbuiltin is not published, so a consumer of jsorder carries
+`replace github.com/trutohq/jsbuiltin => ../jsbuiltin` (adjusted for its depth).
