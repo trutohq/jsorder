@@ -91,6 +91,9 @@ package does. See `number.go`.
 jsorder.MarshalJS(v)      // JS enumeration order — the wire, and anything hashed
 jsorder.StableMarshal(v)  // keys sorted bytewise — hashing internal to Go
 jsorder.AppendJS(dst, v)  // MarshalJS into a caller-owned buffer
+jsorder.MarshalJSWith(v, jsorder.Options{Indent: "  ", Replacer: f})
+                          // JSON.stringify(v, replacer, indent): the replacer
+                          // also stands in for toJSON on the caller's own types
 ```
 
 This split is D-0008; goenvoy hit the bug it prevents. They differ on exactly

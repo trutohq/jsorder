@@ -71,6 +71,61 @@ func AppendJS(dst []byte, v any) ([]byte, error) {
 type encoder struct {
 	stable bool
 	depth  int
+	// replacer and indent are MarshalJSWith's Options.
+	replacer func(any) any
+	indent   string
+}
+
+// Options are the second and third arguments of JSON.stringify.
+type Options struct {
+	// Replacer, when set, is called on every value before it is written:
+	// the top-level value, each object member's value and each array item.
+	// What it returns is written in its place (and is not passed to it
+	// again). It plays the part of toJSON and of a replacer function: a
+	// consumer whose values hold types this package does not know (a host
+	// value with a toJSON, a sentinel) maps them to the JSON value model.
+	// As in JavaScript, a nil it returns for an object member omits the key,
+	// for an array item is written null, and at the top level is "null".
+	Replacer func(v any) any
+	// Indent is JSON.stringify's space argument as a string: "" writes
+	// compactly; otherwise each nested level starts on a new line indented by
+	// one more copy of it, and a colon is followed by a space. As in
+	// JavaScript, only its first 10 characters are used.
+	Indent string
+}
+
+// MarshalJSWith encodes v as JSON.stringify(v, replacer, indent) does, with
+// MarshalJS's key order and value rules.
+func MarshalJSWith(v any, o Options) ([]byte, error) {
+	indent := o.Indent
+	if len(indent) > 10 {
+		indent = indent[:10]
+	}
+	e := encoder{replacer: o.Replacer, indent: indent}
+	buf, err := e.value(make([]byte, 0, 256), e.replace(v))
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func (e *encoder) replace(v any) any {
+	if e.replacer == nil {
+		return v
+	}
+	return e.replacer(v)
+}
+
+// newline starts a member's line at the current depth, when indenting.
+func (e *encoder) newline(dst []byte, depth int) []byte {
+	if e.indent == "" {
+		return dst
+	}
+	dst = append(dst, '\n')
+	for i := 0; i < depth; i++ {
+		dst = append(dst, e.indent...)
+	}
+	return dst
 }
 
 // maxDepth bounds recursion. JSON.stringify throws a RangeError on a cyclic or
@@ -175,6 +230,7 @@ func (e *encoder) orderedMap(dst []byte, m *Map) ([]byte, error) {
 	first := true
 	for _, key := range keys {
 		value, _ := m.Get(key)
+		value = e.replace(value)
 		if value == nil {
 			continue // undefined: JSON.stringify omits the key
 		}
@@ -182,14 +238,26 @@ func (e *encoder) orderedMap(dst []byte, m *Map) ([]byte, error) {
 			dst = append(dst, ',')
 		}
 		first = false
+		dst = e.newline(dst, e.depth)
 		dst = AppendString(dst, key)
-		dst = append(dst, ':')
+		dst = e.colon(dst)
 		var err error
 		if dst, err = e.value(dst, value); err != nil {
 			return nil, err
 		}
 	}
+	if !first {
+		dst = e.newline(dst, e.depth-1)
+	}
 	return append(dst, '}'), nil
+}
+
+// colon writes a member's colon, followed by a space when indenting.
+func (e *encoder) colon(dst []byte) []byte {
+	if e.indent == "" {
+		return append(dst, ':')
+	}
+	return append(dst, ':', ' ')
 }
 
 func (e *encoder) plainMap(dst []byte, m map[string]any) ([]byte, error) {
@@ -215,7 +283,7 @@ func (e *encoder) plainMap(dst []byte, m map[string]any) ([]byte, error) {
 	dst = append(dst, '{')
 	first := true
 	for _, key := range keys {
-		value := m[key]
+		value := e.replace(m[key])
 		if value == nil {
 			continue
 		}
@@ -223,12 +291,16 @@ func (e *encoder) plainMap(dst []byte, m map[string]any) ([]byte, error) {
 			dst = append(dst, ',')
 		}
 		first = false
+		dst = e.newline(dst, e.depth)
 		dst = AppendString(dst, key)
-		dst = append(dst, ':')
+		dst = e.colon(dst)
 		var err error
 		if dst, err = e.value(dst, value); err != nil {
 			return nil, err
 		}
+	}
+	if !first {
+		dst = e.newline(dst, e.depth-1)
 	}
 	return append(dst, '}'), nil
 }
@@ -244,6 +316,8 @@ func (e *encoder) array(dst []byte, a []any) ([]byte, error) {
 		if i > 0 {
 			dst = append(dst, ',')
 		}
+		dst = e.newline(dst, e.depth)
+		item = e.replace(item)
 		var err error
 		// A nil element is undefined, and JSON.stringify writes null for an
 		// undefined array element rather than omitting it — an array's length
@@ -251,6 +325,9 @@ func (e *encoder) array(dst []byte, a []any) ([]byte, error) {
 		if dst, err = e.value(dst, item); err != nil {
 			return nil, err
 		}
+	}
+	if len(a) > 0 {
+		dst = e.newline(dst, e.depth-1)
 	}
 	return append(dst, ']'), nil
 }
