@@ -6,7 +6,7 @@ go 1.27.0
 replace github.com/trutohq/jsbuiltin => ../jsbuiltin
 
 require (
-	github.com/recolabs/gnata v0.4.0
+	github.com/recolabs/gnata v0.6.2
 	github.com/trutohq/jsbuiltin v0.0.0
 )
 
